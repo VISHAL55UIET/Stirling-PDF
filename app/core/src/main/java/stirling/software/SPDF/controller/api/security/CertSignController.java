@@ -11,6 +11,7 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Calendar;
 import java.util.List;
+import java.util.Optional;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -75,6 +76,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import stirling.software.SPDF.config.swagger.StandardPdfResponse;
 import stirling.software.SPDF.model.api.security.SignPDFWithCertRequest;
+import stirling.software.SPDF.pdf.signature.CertificateLogoExtractor;
 import stirling.software.SPDF.pdf.signature.CreateSignatureBase;
 import stirling.software.SPDF.service.HardwareKeyStoreService;
 import stirling.software.common.annotations.AutoJobPostMapping;
@@ -472,6 +474,7 @@ public class CertSignController {
             ClassPathResource resource = new ClassPathResource("static/images/signature.png");
             try (InputStream is = resource.getInputStream()) {
                 logoFile = Files.createTempFile("signature", ".png").toFile();
+                logoFile.deleteOnExit();
                 FileUtils.copyInputStreamToFile(is, logoFile);
             } catch (IOException e) {
                 log.error("Failed to load image signature file");
@@ -518,6 +521,8 @@ public class CertSignController {
                 appearance.setNormalAppearance(appearanceStream);
                 widget.setAppearance(appearance);
 
+                X509Certificate cert = (X509Certificate) getCertificateChain()[0];
+
                 try (PDPageContentStream cs = new PDPageContentStream(doc, appearanceStream)) {
                     if (Boolean.TRUE.equals(showLogo)) {
                         cs.saveGraphicsState();
@@ -525,10 +530,19 @@ public class CertSignController {
                         extState.setBlendMode(BlendMode.MULTIPLY);
                         extState.setNonStrokingAlphaConstant(0.5f);
                         cs.setGraphicsStateParameters(extState);
-                        cs.transform(Matrix.getScaleInstance(0.08f, 0.08f));
-                        PDImageXObject img =
-                                PDImageXObject.createFromFileByExtension(logoFile, doc);
-                        cs.drawImage(img, 100, 0);
+
+                        Optional<byte[]> certLogo = CertificateLogoExtractor.extractLogo(cert);
+                        if (certLogo.isPresent()) {
+                            PDImageXObject certImg =
+                                    PDImageXObject.createFromByteArray(
+                                            doc, certLogo.get(), "cert-logo");
+                            drawScaledLogo(cs, certImg, bbox.getWidth(), bbox.getHeight());
+                        } else {
+                            cs.transform(Matrix.getScaleInstance(0.08f, 0.08f));
+                            PDImageXObject img =
+                                    PDImageXObject.createFromFileByExtension(logoFile, doc);
+                            cs.drawImage(img, 100, 0);
+                        }
                         cs.restoreGraphicsState();
                     }
 
@@ -541,13 +555,7 @@ public class CertSignController {
                     cs.newLineAtOffset(fontSize, height - leading);
                     cs.setLeading(leading);
 
-                    X509Certificate cert = (X509Certificate) getCertificateChain()[0];
-
-                    // https://stackoverflow.com/questions/2914521/
-                    X500Name x500Name = new X500Name(cert.getSubjectX500Principal().getName());
-                    RDN cn = x500Name.getRDNs(BCStyle.CN)[0];
-                    String name = IETFUtils.valueToString(cn.getFirst().getValue());
-
+                    String name = extractSignerCommonName(cert);
                     String date = signature.getSignDate().getTime().toString();
                     String reason = signature.getReason();
 
@@ -566,6 +574,33 @@ public class CertSignController {
                 doc.save(baos);
                 return new ByteArrayInputStream(baos.toByteArray());
             }
+        }
+
+        private static void drawScaledLogo(
+                PDPageContentStream cs, PDImageXObject img, float boxWidth, float boxHeight)
+                throws IOException {
+            float imgWidth = img.getWidth();
+            float imgHeight = img.getHeight();
+            if (imgWidth <= 0 || imgHeight <= 0) {
+                return;
+            }
+            float maxLogoHeight = boxHeight * 0.8f;
+            float maxLogoWidth = boxWidth * 0.4f;
+            float scale = Math.min(maxLogoWidth / imgWidth, maxLogoHeight / imgHeight);
+            float drawWidth = imgWidth * scale;
+            float drawHeight = imgHeight * scale;
+            float x = (boxWidth - drawWidth) / 2f;
+            float y = (boxHeight - drawHeight) / 2f;
+            cs.drawImage(img, x, y, drawWidth, drawHeight);
+        }
+
+        private static String extractSignerCommonName(X509Certificate cert) {
+            X500Name x500Name = new X500Name(cert.getSubjectX500Principal().getName());
+            RDN[] cns = x500Name.getRDNs(BCStyle.CN);
+            if (cns != null && cns.length > 0 && cns[0].getFirst() != null) {
+                return IETFUtils.valueToString(cns[0].getFirst().getValue());
+            }
+            return cert.getSubjectX500Principal().getName();
         }
     }
 }

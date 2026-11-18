@@ -644,4 +644,189 @@ class CertSignControllerTest {
             return is.readAllBytes();
         }
     }
+
+    @Test
+    void testSignPdfUsesEmbeddedCertificateLogoWhenShowLogoIsTrue() throws Exception {
+        // Create a distinct 12x12 solid-red PNG image to embed in the certificate
+        java.awt.image.BufferedImage customLogo =
+                new java.awt.image.BufferedImage(
+                        12, 12, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        java.awt.Graphics2D g = customLogo.createGraphics();
+        g.setColor(java.awt.Color.RED);
+        g.fillRect(0, 0, 12, 12);
+        g.dispose();
+        ByteArrayOutputStream pngOut = new ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(customLogo, "png", pngOut);
+        byte[] customPngBytes = pngOut.toByteArray();
+
+        String dataUri =
+                "data:image/png;base64,"
+                        + java.util.Base64.getEncoder().encodeToString(customPngBytes);
+        byte[][] pemPairWithLogo = pemPairWithLogotypeUri(dataUri);
+
+        SignPDFWithCertRequest request = new SignPDFWithCertRequest();
+        request.setFileInput(
+                new MockMultipartFile(
+                        "fileInput", "test.pdf", MediaType.APPLICATION_PDF_VALUE, pdfBytes));
+        request.setCertType("PEM");
+        request.setPrivateKeyFile(
+                new MockMultipartFile(
+                        "privateKeyFile", "key.pem", "text/plain", pemPairWithLogo[0]));
+        request.setCertFile(
+                new MockMultipartFile("certFile", "cert.pem", "text/plain", pemPairWithLogo[1]));
+        request.setShowSignature(true);
+        request.setShowLogo(true);
+        request.setPageNumber(1);
+
+        ResponseEntity<Resource> response =
+                certSignController.signPDFWithCert(request, httpRequest);
+
+        try (PDDocument signedDoc = Loader.loadPDF(drainBody(response))) {
+            org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget widget =
+                    signedDoc.getPage(0).getAnnotations().stream()
+                            .filter(
+                                    org.apache.pdfbox.pdmodel.interactive.annotation
+                                                    .PDAnnotationWidget.class
+                                            ::isInstance)
+                            .map(
+                                    org.apache.pdfbox.pdmodel.interactive.annotation
+                                                    .PDAnnotationWidget.class
+                                            ::cast)
+                            .findFirst()
+                            .orElseThrow();
+            org.apache.pdfbox.pdmodel.PDResources resources =
+                    widget.getNormalAppearanceStream().getResources();
+            org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject embeddedImg = null;
+            for (org.apache.pdfbox.cos.COSName name : resources.getXObjectNames()) {
+                if (resources.getXObject(name)
+                        instanceof org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject imgObj) {
+                    embeddedImg = imgObj;
+                    break;
+                }
+            }
+            assertNotNull(embeddedImg, "Expected embedded certificate logo image in appearance");
+            assertEquals(12, embeddedImg.getWidth());
+            assertEquals(12, embeddedImg.getHeight());
+            assertEquals(java.awt.Color.RED.getRGB(), embeddedImg.getImage().getRGB(6, 6));
+        }
+    }
+
+    @Test
+    void testSignPdfFallsBackToDefaultLogoWhenCertificateHasNoLogotype() throws Exception {
+        SignPDFWithCertRequest request = unencryptedPemRequest();
+        request.setShowSignature(true);
+        request.setShowLogo(true);
+        request.setPageNumber(1);
+
+        ResponseEntity<Resource> response =
+                certSignController.signPDFWithCert(request, httpRequest);
+
+        try (PDDocument signedDoc = Loader.loadPDF(drainBody(response))) {
+            org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationWidget widget =
+                    signedDoc.getPage(0).getAnnotations().stream()
+                            .filter(
+                                    org.apache.pdfbox.pdmodel.interactive.annotation
+                                                    .PDAnnotationWidget.class
+                                            ::isInstance)
+                            .map(
+                                    org.apache.pdfbox.pdmodel.interactive.annotation
+                                                    .PDAnnotationWidget.class
+                                            ::cast)
+                            .findFirst()
+                            .orElseThrow();
+            org.apache.pdfbox.pdmodel.PDResources resources =
+                    widget.getNormalAppearanceStream().getResources();
+            boolean hasDefaultLogo = false;
+            for (org.apache.pdfbox.cos.COSName name : resources.getXObjectNames()) {
+                if (resources.getXObject(name)
+                        instanceof org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject imgObj) {
+                    // Default static/images/signature.png is much larger than 12x12
+                    hasDefaultLogo = imgObj.getWidth() > 12 && imgObj.getHeight() > 12;
+                }
+            }
+            assertTrue(hasDefaultLogo, "Expected fallback to default signature.png logo");
+        }
+    }
+
+    @Test
+    void testCertificateLogoExtractorIgnoresExternalHttpUris() throws Exception {
+        byte[][] pemPairExternal = pemPairWithLogotypeUri("https://example.com/logo.png");
+        X509Certificate cert =
+                (X509Certificate)
+                        CertificateFactory.getInstance("X.509")
+                                .generateCertificate(new ByteArrayInputStream(pemPairExternal[1]));
+
+        assertTrue(
+                stirling.software
+                        .SPDF
+                        .pdf
+                        .signature
+                        .CertificateLogoExtractor
+                        .extractLogo(cert)
+                        .isEmpty());
+    }
+
+    private static byte[][] pemPairWithLogotypeUri(String logotypeUri) throws Exception {
+        java.security.KeyPairGenerator generator =
+                java.security.KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        java.security.KeyPair pair = generator.generateKeyPair();
+        org.bouncycastle.asn1.x500.X500Name subject =
+                new org.bouncycastle.asn1.x500.X500Name("CN=Logo Tester");
+        java.util.Date now = new java.util.Date();
+
+        // Build RFC 3709 LogotypeExtn ASN.1 structure with subjectLogo [2] -> direct [0] -> image
+        // [0]
+        org.bouncycastle.asn1.ASN1EncodableVector detailsVec =
+                new org.bouncycastle.asn1.ASN1EncodableVector();
+        detailsVec.add(new org.bouncycastle.asn1.DERIA5String("image/png"));
+        detailsVec.add(new org.bouncycastle.asn1.DERSequence()); // logotypeHash
+        detailsVec.add(
+                new org.bouncycastle.asn1.DERSequence(
+                        new org.bouncycastle.asn1.DERIA5String(logotypeUri)));
+
+        org.bouncycastle.asn1.DERSequence logotypeImage =
+                new org.bouncycastle.asn1.DERSequence(
+                        new org.bouncycastle.asn1.DERSequence(detailsVec));
+        org.bouncycastle.asn1.DERSequence logotypeData =
+                new org.bouncycastle.asn1.DERSequence(
+                        new org.bouncycastle.asn1.DERTaggedObject(
+                                true, 0, new org.bouncycastle.asn1.DERSequence(logotypeImage)));
+        org.bouncycastle.asn1.DERTaggedObject directInfo =
+                new org.bouncycastle.asn1.DERTaggedObject(true, 0, logotypeData);
+        org.bouncycastle.asn1.DERSequence logotypeExtn =
+                new org.bouncycastle.asn1.DERSequence(
+                        new org.bouncycastle.asn1.DERTaggedObject(true, 2, directInfo));
+
+        org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder certBuilder =
+                new org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder(
+                        subject,
+                        java.math.BigInteger.TWO,
+                        now,
+                        new java.util.Date(now.getTime() + 86_400_000L),
+                        subject,
+                        pair.getPublic());
+        certBuilder.addExtension(
+                new org.bouncycastle.asn1.ASN1ObjectIdentifier(
+                        stirling.software
+                                .SPDF
+                                .pdf
+                                .signature
+                                .CertificateLogoExtractor
+                                .LOGOTYPE_EXTENSION_OID),
+                false,
+                logotypeExtn);
+
+        X509Certificate cert =
+                new org.bouncycastle.cert.jcajce.JcaX509CertificateConverter()
+                        .getCertificate(
+                                certBuilder.build(
+                                        new org.bouncycastle.operator.jcajce
+                                                        .JcaContentSignerBuilder("SHA256withRSA")
+                                                .build(pair.getPrivate())));
+        return new byte[][] {
+            pem("PRIVATE KEY", pair.getPrivate().getEncoded()),
+            pem("CERTIFICATE", cert.getEncoded())
+        };
+    }
 }
